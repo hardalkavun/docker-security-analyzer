@@ -1,0 +1,18 @@
+{
+    "containers": [
+        {
+            "id": "3bbabb23785e",
+            "image": "nginx",
+            "risk": "HIGH",
+            "issues": [
+                "Running as root",
+                "Exposed ports"
+            ]
+        }
+    ],
+    "summary": {
+        "LOW": 0,
+        "MEDIUM": 0,
+        "HIGH": 1
+    }
+}
