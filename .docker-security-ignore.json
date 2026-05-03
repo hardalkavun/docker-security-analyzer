@@ -1,0 +1,10 @@
+{
+  "ignore": [
+    {
+      "id": "container_runs_as_root",
+      "image_contains": "kali",
+      "reason": "Security lab images often run as root intentionally.",
+      "expires": "2026-12-31"
+    }
+  ]
+}

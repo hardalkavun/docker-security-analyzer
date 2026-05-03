@@ -1,0 +1,66 @@
+{
+  "profiles": {
+    "default": {
+      "description": "Balanced local development and demo profile",
+      "fail_on": "CRITICAL"
+    },
+    "production": {
+      "description": "Stricter profile for CI/CD security gates",
+      "fail_on": "HIGH"
+    },
+    "security-lab": {
+      "description": "Allows some lab-oriented images while keeping host escape checks strict",
+      "fail_on": "CRITICAL"
+    }
+  },
+  "container_rules": [
+    {
+      "id": "policy_privileged_forbidden",
+      "type": "host_config_equals",
+      "field": "Privileged",
+      "value": true,
+      "title": "Policy forbids privileged containers",
+      "severity": "CRITICAL",
+      "category": "policy",
+      "impact": "Privileged mode grants broad host-level access.",
+      "recommendation": "Remove privileged mode and grant only required capabilities.",
+      "cis": "CIS Docker 5.4"
+    },
+    {
+      "id": "policy_docker_socket_forbidden",
+      "type": "mount_contains",
+      "token": "/var/run/docker.sock",
+      "title": "Policy forbids Docker socket mounts",
+      "severity": "CRITICAL",
+      "category": "policy",
+      "impact": "Docker socket access can allow control of the host Docker daemon.",
+      "recommendation": "Remove docker.sock mounts or use a restricted socket proxy.",
+      "cis": "CIS Docker 5.31"
+    },
+    {
+      "id": "policy_runtime_secret",
+      "type": "env_name_contains",
+      "patterns": ["PASSWORD", "TOKEN", "SECRET", "API_KEY"],
+      "title": "Policy forbids secrets in environment variables",
+      "severity": "HIGH",
+      "category": "policy",
+      "impact": "Secrets in environment variables are easy to expose through inspect data and logs.",
+      "recommendation": "Move secrets to Docker secrets or an external secret manager.",
+      "cis": "CIS Docker 5.30"
+    }
+  ],
+  "project_rules": [
+    {
+      "id": "policy_dockerfile_requires_user",
+      "type": "file_missing",
+      "path": "Dockerfile",
+      "token": "USER ",
+      "title": "Policy requires Dockerfile USER instruction",
+      "severity": "HIGH",
+      "category": "policy",
+      "impact": "Images without an explicit USER usually run as root.",
+      "recommendation": "Create a dedicated application user and add USER before runtime commands.",
+      "cis": "CIS Docker 4.1"
+    }
+  ]
+}
