@@ -63,3 +63,9 @@ Then open `http://127.0.0.1:5000/`.
 python -m unittest
 ```
 "# docker-security-analyzer" 
+
+
+
+
+<img width="1920" height="955" alt="image" src="https://github.com/user-attachments/assets/003e788b-a458-49da-9afe-bb7972607ef1" />
+<img width="1072" height="953" alt="image" src="https://github.com/user-attachments/assets/74fb35ca-0f16-488f-8cfe-76e99646960c" />
