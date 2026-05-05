@@ -62,6 +62,23 @@ class ScannerScoringTests(unittest.TestCase):
         result = analyze(container)
         self.assertEqual(result["risk"], "CRITICAL")
 
+    def test_unconfined_seccomp_is_reported(self):
+        container = container_fixture(
+            HostConfig={
+                "Binds": None,
+                "ReadonlyRootfs": True,
+                "Privileged": False,
+                "CapAdd": None,
+                "CapDrop": ["ALL"],
+                "SecurityOpt": ["no-new-privileges:true", "seccomp=unconfined"],
+                "PidMode": "",
+                "IpcMode": "",
+                "NetworkMode": "bridge",
+            },
+        )
+        result = analyze(container)
+        self.assertIn("HIGH: Seccomp is explicitly disabled", result["issues"])
+
     def test_single_high_maps_to_medium(self):
         self.assertEqual(calculate_risk([{"severity": "HIGH"}]), "MEDIUM")
 

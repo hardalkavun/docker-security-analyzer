@@ -3,16 +3,21 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import subprocess
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from flask import Flask, Response, abort, render_template_string, request, send_file
+from flask import Flask, Response, abort, redirect, render_template_string, request, send_file, url_for
 from scanner import exporters
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
 REPORT_PATH = Path(__file__).with_name("report.json")
+SCAN_TIMEOUT_SECONDS = 300
+REPORT_STALE_MINUTES = 60
 RISK_LEVELS = ("SAFE", "LOW", "MEDIUM", "HIGH", "CRITICAL")
 RISK_COLORS = {
     "CRITICAL": "#b91c1c",
@@ -48,6 +53,118 @@ def load_report() -> tuple[dict[str, Any], str | None]:
     if not isinstance(data.get("project_files"), dict):
         data["project_files"] = {"findings": []}
     return data, None
+
+
+def current_running_container_ids() -> tuple[set[str], str | None]:
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "--format", "{{.ID}}"],
+            cwd=REPORT_PATH.parent,
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return set(), f"Docker live status okunamadi: {exc}"
+
+    if result.returncode != 0:
+        return set(), result.stderr.strip() or "Docker live status okunamadi."
+    return {cid for cid in result.stdout.strip().splitlines() if cid}, None
+
+
+def ids_match(container_id: str, running_id: str) -> bool:
+    return bool(container_id and running_id and (container_id.startswith(running_id) or running_id.startswith(container_id)))
+
+
+def annotate_live_status(containers: list[dict[str, Any]], running_ids: set[str], live_error: str | None) -> None:
+    for container in containers:
+        container_id = str(container.get("id", ""))
+        docker_state = container.get("docker_state") if isinstance(container.get("docker_state"), dict) else {}
+        container["report_state"] = docker_state.get("status") or container.get("runtime_status") or "unknown"
+        if live_error:
+            container["live_status"] = "unknown"
+        elif any(ids_match(container_id, running_id) for running_id in running_ids):
+            container["live_status"] = "running"
+        else:
+            container["live_status"] = "not_running"
+
+
+def summarize_live(containers: list[dict[str, Any]]) -> dict[str, int]:
+    return {
+        "running": sum(1 for container in containers if container.get("live_status") == "running"),
+        "not_running": sum(1 for container in containers if container.get("live_status") == "not_running"),
+        "unknown": sum(1 for container in containers if container.get("live_status") == "unknown"),
+    }
+
+
+def parse_scan_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def format_age(minutes: int | None) -> str:
+    if minutes is None:
+        return "unknown"
+    if minutes < 1:
+        return "less than a minute"
+    if minutes < 60:
+        return f"{minutes} min"
+    hours, remainder = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h {remainder}m"
+    days, hours = divmod(hours, 24)
+    return f"{days}d {hours}h"
+
+
+def build_report_meta(data: dict[str, Any], containers: list[dict[str, Any]], running_ids: set[str], live_error: str | None) -> dict[str, Any]:
+    scan_time = parse_scan_timestamp(data.get("scan_timestamp"))
+    age_minutes: int | None = None
+    stale_reasons: list[str] = []
+    if scan_time is None:
+        stale_reasons.append("Scan timestamp is missing, so report freshness cannot be verified.")
+    else:
+        age_delta = datetime.now(timezone.utc) - scan_time.astimezone(timezone.utc)
+        age_minutes = max(0, int(age_delta.total_seconds() // 60))
+        if age_minutes > REPORT_STALE_MINUTES:
+            stale_reasons.append(f"Report is older than {REPORT_STALE_MINUTES} minutes.")
+
+    docker_meta = data.get("docker") if isinstance(data.get("docker"), dict) else {}
+    docker_mode = docker_meta.get("mode", "running")
+    live_summary = summarize_live(containers)
+    if live_error:
+        stale_reasons.append(live_error)
+    else:
+        report_ids = {str(container.get("id", "")) for container in containers}
+        has_unreported_running = any(not any(ids_match(report_id, running_id) for report_id in report_ids) for running_id in running_ids)
+        if docker_mode == "running" and live_summary["not_running"] > 0:
+            stale_reasons.append("Report lists containers that are no longer running.")
+        if docker_mode == "running" and containers and not running_ids:
+            stale_reasons.append("Docker currently reports no running containers, but the report still has container entries.")
+        if has_unreported_running:
+            stale_reasons.append("Docker has running containers that are not present in this report.")
+
+    return {
+        "age_minutes": age_minutes,
+        "age_label": format_age(age_minutes),
+        "docker_mode": docker_mode,
+        "running_now": live_summary["running"],
+        "not_running_now": live_summary["not_running"],
+        "unknown_now": live_summary["unknown"],
+        "stale_reasons": stale_reasons,
+        "is_stale": bool(stale_reasons),
+    }
+
+
+def is_local_request() -> bool:
+    return request.remote_addr in {"127.0.0.1", "::1", "localhost"}
 
 
 def normalize_filter(raw_filter: str | None) -> str:
@@ -170,6 +287,27 @@ BASE_CSS = """
         border-radius: 8px;
         padding: 12px 14px;
     }
+    .notice.success {
+        border-color: #22c55e;
+        background: #f0fdf4;
+        color: #166534;
+    }
+    .mini-form { margin: 0; }
+    .status-line { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
+    .status-badge {
+        display: inline-flex;
+        min-height: 24px;
+        align-items: center;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        padding: 2px 9px;
+        font-size: 12px;
+        font-weight: 800;
+        text-transform: uppercase;
+    }
+    .status-running { border-color: #16a34a; background: #dcfce7; color: #166534; }
+    .status-not_running { border-color: #f59e0b; background: #fffbeb; color: #92400e; }
+    .status-unknown { border-color: #94a3b8; background: #f1f5f9; color: #475569; }
     .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 12px; margin-bottom: 18px; }
     .summary-item { padding: 14px; box-shadow: none; }
     .summary-label { color: var(--muted); font-size: 12px; font-weight: 800; text-transform: uppercase; }
@@ -270,8 +408,12 @@ HTML = """
     </header>
 
     <main class="container page">
+        {% if scan_message %}<div class="notice success">{{ scan_message }}</div>{% endif %}
         {% if error_message %}<div class="notice">{{ error_message }}</div>{% endif %}
         {% if data.get('scan_error') %}<div class="notice">Docker scan warning: {{ data.get('scan_error') }}</div>{% endif %}
+        {% for reason in report_meta.get('stale_reasons', []) %}
+        <div class="notice">Report freshness warning: {{ reason }}</div>
+        {% endfor %}
 
         <div class="toolbar">
             <form class="filter-form" method="GET">
@@ -285,6 +427,9 @@ HTML = """
                 <button type="submit">Filter</button>
             </form>
             <div class="actions">
+                <form class="mini-form" method="POST" action="/scan">
+                    <button type="submit">Run Scan</button>
+                </form>
                 <a class="button secondary" href="/export/json">JSON Export</a>
                 <a class="button secondary" href="/export/html">HTML Export</a>
                 <a class="button secondary" href="/export/sarif">SARIF</a>
@@ -293,11 +438,15 @@ HTML = """
             </div>
             <div class="scan-info">
                 {% if data.get('scan_timestamp') %}Last scanned: {{ data['scan_timestamp'] }}{% else %}Scan timestamp unavailable{% endif %}
+                <br>Age: {{ report_meta.get('age_label', 'unknown') }} / Docker mode: {{ report_meta.get('docker_mode', 'running') }}
             </div>
         </div>
 
         <section class="summary-grid" aria-label="Risk summary">
             <div class="summary-item"><div class="summary-label">Containers</div><div class="summary-value">{{ containers|length }}</div></div>
+            <div class="summary-item"><div class="summary-label">Running Now</div><div class="summary-value" style="color: #15803d">{{ live_summary.get('running', 0) }}</div></div>
+            <div class="summary-item"><div class="summary-label">Not Running</div><div class="summary-value" style="color: #ca8a04">{{ live_summary.get('not_running', 0) }}</div></div>
+            <div class="summary-item"><div class="summary-label">Report Age</div><div class="summary-value" style="font-size: 18px;">{{ report_meta.get('age_label', 'unknown') }}</div></div>
             {% for level in risk_levels %}
             <div class="summary-item"><div class="summary-label">{{ level }}</div><div class="summary-value" style="color: {{ get_risk_color(level) }}">{{ summary.get(level, 0) }}</div></div>
             {% endfor %}
@@ -330,6 +479,10 @@ HTML = """
                     <div class="card-title">{{ c.get("id", "")[:12] or "unknown" }}</div>
                     <div class="meta">Image: <code>{{ c.get("image", "unknown") }}</code></div>
                     <div class="meta">User: <code>{{ c.get("user") or "root" }}</code></div>
+                    <div class="status-line">
+                        <span class="status-badge status-{{ c.get('live_status', 'unknown') }}">Live: {{ c.get('live_status', 'unknown').replace('_', ' ') }}</span>
+                        <span class="status-badge status-unknown">Report: {{ c.get('report_state', 'unknown') }}</span>
+                    </div>
                 </div>
                 <div>
                     <div class="risk-badge" style="background-color: {{ get_risk_color(c.get('risk')) }};">{{ c.get("risk", "SAFE") }}</div>
@@ -469,6 +622,11 @@ DETAIL_HTML = """
             <p><strong>User:</strong> <code>{{ c.get("user") or "root" }}</code></p>
             <p><strong>Risk Level:</strong> <span class="risk-badge" style="background-color: {{ get_risk_color(c.get('risk')) }}">{{ c.get("risk", "SAFE") }}</span></p>
             <p><strong>Security Score:</strong> {{ c.get("score", 0) }}/100</p>
+            <p>
+                <strong>Live Status:</strong>
+                <span class="status-badge status-{{ c.get('live_status', 'unknown') }}">{{ c.get('live_status', 'unknown').replace('_', ' ') }}</span>
+                <strong>Report State:</strong> {{ c.get('report_state', 'unknown') }}
+            </p>
             {% if c.get('risk_reasoning') %}<p><strong>Reasoning:</strong> {{ c.get('risk_reasoning') }}</p>{% endif %}
             {% if c.get('attack_path') %}
             <h2>Attack Path</h2>
@@ -500,6 +658,9 @@ DETAIL_HTML = """
 def index():
     data, error_message = load_report()
     containers = copy.deepcopy(data.get("containers", []))
+    running_ids, live_error = current_running_container_ids()
+    annotate_live_status(containers, running_ids, live_error)
+    report_meta = build_report_meta(data, containers, running_ids, live_error)
     filter_value = normalize_filter(request.args.get("filter"))
     if filter_value:
         containers = [c for c in containers if str(c.get("risk", "")).upper() == filter_value]
@@ -509,6 +670,8 @@ def index():
         data=data,
         containers=containers,
         summary=summarize(containers),
+        live_summary=summarize_live(containers),
+        report_meta=report_meta,
         risk_levels=RISK_LEVELS,
         get_risk_color=get_risk_color,
         finding_class=finding_class,
@@ -516,13 +679,17 @@ def index():
         collect_remediations=collect_remediations,
         filter_value=filter_value,
         error_message=error_message,
+        scan_message=request.args.get("scan_message", ""),
     )
 
 
 @app.route("/container/<cid>")
 def container_detail(cid: str):
     data, _ = load_report()
-    container = next((c for c in data.get("containers", []) if c.get("id") == cid), None)
+    containers = copy.deepcopy(data.get("containers", []))
+    running_ids, live_error = current_running_container_ids()
+    annotate_live_status(containers, running_ids, live_error)
+    container = next((c for c in containers if c.get("id") == cid), None)
     if container is None:
         abort(404, description="Container not found")
     return render_template_string(
@@ -531,6 +698,32 @@ def container_detail(cid: str):
         get_risk_color=get_risk_color,
         finding_class=finding_class,
     )
+
+
+@app.route("/scan", methods=["POST"])
+def run_scan():
+    if not is_local_request():
+        abort(403, description="Scan can only be started from localhost")
+
+    try:
+        result = subprocess.run(
+            [sys.executable, str(REPORT_PATH.with_name("main.py"))],
+            cwd=REPORT_PATH.parent,
+            capture_output=True,
+            text=True,
+            timeout=SCAN_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return redirect(url_for("index", scan_message=f"Scan timed out after {SCAN_TIMEOUT_SECONDS} seconds."))
+    except OSError as exc:
+        return redirect(url_for("index", scan_message=f"Scan could not be started: {exc}"))
+
+    output = (result.stdout or result.stderr or "").strip().splitlines()
+    tail = output[-1] if output else "No scanner output."
+    if result.returncode != 0:
+        return redirect(url_for("index", scan_message=f"Scan finished with errors: {tail}"))
+    return redirect(url_for("index", scan_message=f"Scan completed: {tail}"))
 
 
 @app.route("/export/json")
@@ -543,11 +736,17 @@ def export_json():
 @app.route("/export/html")
 def export_html():
     data, error_message = load_report()
+    containers = copy.deepcopy(data.get("containers", []))
+    running_ids, live_error = current_running_container_ids()
+    annotate_live_status(containers, running_ids, live_error)
+    report_meta = build_report_meta(data, containers, running_ids, live_error)
     rendered = render_template_string(
         HTML,
         data=data,
-        containers=data.get("containers", []),
-        summary=summarize(data.get("containers", [])),
+        containers=containers,
+        summary=summarize(containers),
+        live_summary=summarize_live(containers),
+        report_meta=report_meta,
         risk_levels=RISK_LEVELS,
         get_risk_color=get_risk_color,
         finding_class=finding_class,
@@ -555,6 +754,7 @@ def export_html():
         collect_remediations=collect_remediations,
         filter_value="",
         error_message=error_message,
+        scan_message="",
     )
     return Response(
         rendered,

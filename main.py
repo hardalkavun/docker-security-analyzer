@@ -53,14 +53,25 @@ SENSITIVE_PORTS = {
 }
 COMMON_SERVICE_IMAGES = ("nginx", "redis", "postgres", "mysql", "mongo", "elasticsearch")
 TOOL_IMAGES = ("kali", "parrot", "security")
+DANGEROUS_CAPABILITIES = {
+    "SYS_ADMIN",
+    "NET_ADMIN",
+    "SYS_PTRACE",
+    "DAC_READ_SEARCH",
+    "SYS_MODULE",
+    "SYS_RAWIO",
+}
 
 
 def run_docker(args: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["docker", *args], capture_output=True, text=True, check=False)
 
 
-def get_containers() -> list[str]:
-    result = run_docker(["ps", "--format", "{{.ID}}"])
+def get_containers(*, include_stopped: bool = False) -> list[str]:
+    args = ["ps", "--format", "{{.ID}}"]
+    if include_stopped:
+        args.insert(1, "--all")
+    result = run_docker(args)
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "docker ps failed")
     return [cid for cid in result.stdout.strip().splitlines() if cid]
@@ -249,6 +260,7 @@ def runtime_findings(container: dict[str, Any]) -> list[dict[str, str]]:
     security_opts = host_config.get("SecurityOpt") or []
     cap_add = host_config.get("CapAdd") or []
     cap_drop = host_config.get("CapDrop") or []
+    security_opt_values = [str(opt).lower() for opt in security_opts]
 
     if user in ("", "root", "0"):
         findings.append(make_finding(
@@ -299,7 +311,8 @@ def runtime_findings(container: dict[str, Any]) -> list[dict[str, str]]:
         ))
 
     if cap_add:
-        severity = "HIGH" if any(str(cap).upper() in {"SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE"} for cap in cap_add) else "MEDIUM"
+        dangerous_caps = sorted(str(cap).upper() for cap in cap_add if str(cap).upper() in DANGEROUS_CAPABILITIES)
+        severity = "HIGH" if dangerous_caps else "MEDIUM"
         findings.append(make_finding(
             "extra_capabilities_added",
             "Extra Linux capabilities are added",
@@ -311,7 +324,7 @@ def runtime_findings(container: dict[str, Any]) -> list[dict[str, str]]:
             "CIS Docker 5.3",
         ))
 
-    if not any("no-new-privileges:true" in str(opt).lower() for opt in security_opts):
+    if not any("no-new-privileges:true" in opt for opt in security_opt_values):
         findings.append(make_finding(
             "no_new_privileges_missing",
             "no-new-privileges is not enabled",
@@ -323,7 +336,18 @@ def runtime_findings(container: dict[str, Any]) -> list[dict[str, str]]:
             "CIS Docker 5.25",
         ))
 
-    if not any(str(opt).lower().startswith("seccomp=") for opt in security_opts):
+    if any("seccomp=unconfined" in opt or "seccomp:unconfined" in opt for opt in security_opt_values):
+        findings.append(make_finding(
+            "seccomp_unconfined",
+            "Seccomp is explicitly disabled",
+            "HIGH",
+            "runtime",
+            f"HostConfig.SecurityOpt={security_opts}",
+            "The container can access a much larger syscall surface than Docker's default profile allows.",
+            "Remove seccomp=unconfined and use Docker's default or a workload-specific restricted seccomp profile.",
+            "CIS Docker 5.21",
+        ))
+    elif not any(opt.startswith("seccomp=") or opt.startswith("seccomp:") for opt in security_opt_values):
         findings.append(make_finding(
             "seccomp_profile_not_explicit",
             "No explicit seccomp profile is configured",
@@ -333,6 +357,18 @@ def runtime_findings(container: dict[str, Any]) -> list[dict[str, str]]:
             "The default may be acceptable, but sensitive workloads should pin an expected seccomp profile.",
             "Use Docker's default seccomp profile explicitly or a workload-specific restricted profile.",
             "CIS Docker 5.21",
+        ))
+
+    if any("apparmor=unconfined" in opt or "apparmor:unconfined" in opt for opt in security_opt_values):
+        findings.append(make_finding(
+            "apparmor_unconfined",
+            "AppArmor is explicitly disabled",
+            "HIGH",
+            "runtime",
+            f"HostConfig.SecurityOpt={security_opts}",
+            "The container loses an additional mandatory access-control boundary on supported hosts.",
+            "Remove apparmor=unconfined and use Docker's default AppArmor profile or a tailored profile.",
+            "CIS Docker 5.20",
         ))
 
     if host_config.get("PidMode") == "host":
@@ -357,6 +393,44 @@ def runtime_findings(container: dict[str, Any]) -> list[dict[str, str]]:
             "The container may access host IPC resources and shared memory.",
             "Avoid --ipc=host unless explicitly required.",
             "CIS Docker 5.16",
+        ))
+
+    if host_config.get("UsernsMode") == "host":
+        findings.append(make_finding(
+            "host_user_namespace",
+            "Container disables user namespace isolation",
+            "MEDIUM",
+            "runtime",
+            "HostConfig.UsernsMode=host",
+            "The container does not benefit from user namespace remapping on hosts where it is configured.",
+            "Avoid --userns=host unless there is a documented compatibility reason.",
+            "CIS Docker 5.28",
+        ))
+
+    devices = host_config.get("Devices") or []
+    if devices:
+        findings.append(make_finding(
+            "host_device_mapped",
+            "Host device is mapped into the container",
+            "HIGH",
+            "runtime",
+            f"HostConfig.Devices={devices}",
+            "Direct device access can weaken host isolation or expose sensitive host resources.",
+            "Remove device mappings or narrow them to the exact device and permissions required.",
+            "CIS Docker 5.17",
+        ))
+
+    healthcheck = config.get("Healthcheck") or {}
+    if healthcheck.get("Test") == ["NONE"]:
+        findings.append(make_finding(
+            "healthcheck_disabled",
+            "Image healthcheck is explicitly disabled",
+            "LOW",
+            "runtime",
+            "Config.Healthcheck.Test=['NONE']",
+            "Disabled healthchecks make unhealthy services harder to detect and respond to.",
+            "Keep a lightweight HEALTHCHECK for long-running services where possible.",
+            "CIS Docker 4.6",
         ))
 
     return findings
@@ -433,6 +507,20 @@ def build_recommended_run(container: dict[str, Any]) -> str:
             command.append(f"-p 127.0.0.1:{host_port}:{container_port.split('/', 1)[0]}")
     command.append(image)
     return " ".join(command)
+
+
+def container_state(container: dict[str, Any]) -> dict[str, Any]:
+    state = container.get("State") or {}
+    host_config = container.get("HostConfig") or {}
+    restart_policy = host_config.get("RestartPolicy") or {}
+    return {
+        "status": state.get("Status", "unknown"),
+        "running": bool(state.get("Running", False)),
+        "started_at": state.get("StartedAt", ""),
+        "finished_at": state.get("FinishedAt", ""),
+        "exit_code": state.get("ExitCode"),
+        "restart_policy": restart_policy.get("Name", "no"),
+    }
 
 
 def group_findings(findings: list[dict[str, str]]) -> dict[str, dict[str, Any]]:
@@ -560,6 +648,8 @@ def analyze(
     return {
         "image": image,
         "user": get_nested(container, ("Config", "User"), ""),
+        "runtime_status": str(get_nested(container, ("State", "Status"), "unknown")),
+        "docker_state": container_state(container),
         "risk": risk,
         "score": total_score,
         "risk_reasoning": risk_reasoning(findings, risk),
@@ -755,6 +845,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile", default="default", help="Policy profile name, e.g. default, dev, production")
     parser.add_argument("--enable-cve", action="store_true", help="Run Trivy or Grype if installed")
     parser.add_argument("--no-docker", action="store_true", help="Scan repository files only")
+    parser.add_argument("--include-stopped", action="store_true", help="Scan stopped containers too by using docker ps --all")
     parser.add_argument("--fail-on", default="", help="Exit non-zero when this severity or higher is found")
     parser.add_argument("--write-exports", action="store_true", help="Write SARIF, Markdown and CSV reports")
     return parser.parse_args()
@@ -786,9 +877,14 @@ def main() -> None:
             "profile_config": policy_engine.profile_config(loaded_policy, profile),
             "ignore_rules": len(loaded_ignores),
         },
+        "docker": {
+            "mode": "skipped" if args.no_docker else ("all" if args.include_stopped else "running"),
+            "include_stopped": args.include_stopped,
+            "container_count": 0,
+        },
         "scanner": {
             "name": "docker-security-analyzer",
-            "version": "3.0",
+            "version": "3.1",
             "cve": cve.scanner_status(),
         },
     }
@@ -798,10 +894,12 @@ def main() -> None:
         report["scan_error"] = "Docker runtime scan skipped by --no-docker."
     else:
         try:
-            containers = get_containers()
+            containers = get_containers(include_stopped=args.include_stopped)
         except RuntimeError as exc:
             report["scan_error"] = str(exc)
             containers = []
+
+    report["docker"]["container_count"] = len(containers)
 
     for cid in containers:
         try:
@@ -820,6 +918,8 @@ def main() -> None:
                 "id": cid,
                 "image": "unknown",
                 "user": "",
+                "runtime_status": "unknown",
+                "docker_state": {"status": "unknown", "running": False},
                 "risk": "CRITICAL",
                 "score": 100,
                 "issues": [f"CRITICAL: Container could not be inspected: {exc}"],
@@ -842,6 +942,11 @@ def main() -> None:
     if args.write_exports:
         write_exports(report, root)
 
+    if not containers and not args.no_docker:
+        if args.include_stopped:
+            print("No containers found.")
+        else:
+            print("No running containers found.")
     print(f"Report saved to report.json ({len(report['containers'])} containers)")
     if args.write_exports:
         print("Exports saved to report.sarif, report.md and report.csv")

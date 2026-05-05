@@ -4,7 +4,7 @@ Evidence-based Docker workload security analyzer with runtime checks, repository
 
 ## Highlights
 
-- Docker runtime inspection for root user, privileged mode, host namespaces, capabilities, read-only filesystem, Docker socket mounts, sensitive mounts, public ports, and leaked environment secrets.
+- Docker runtime inspection for root user, privileged mode, host namespaces, capabilities, AppArmor/seccomp weakening, host device mappings, read-only filesystem, Docker socket mounts, sensitive mounts, public ports, and leaked environment secrets.
 - Dockerfile and Compose scanning for risky build and deployment patterns.
 - Policy-driven rules through `security-policy.json`.
 - Ignore management through `.docker-security-ignore.json` with expiry dates and reasons.
@@ -19,6 +19,12 @@ Run a local Docker scan:
 
 ```bash
 python main.py
+```
+
+Include stopped containers in the report:
+
+```bash
+python main.py --include-stopped
 ```
 
 Scan repository files only, useful for CI:
@@ -40,6 +46,8 @@ python app.py
 ```
 
 Then open `http://127.0.0.1:5000/`.
+
+The dashboard shows report age, whether listed containers are still running, and can start a fresh local scan from the `Run Scan` button.
 
 ## Dashboard Exports
 
